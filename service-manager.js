@@ -95,7 +95,8 @@ function writeServiceXml(xmlPath, dataDir, account) {
 
   const accountBlock = account ? `
   <serviceaccount>
-    <username>${escapeXml(account.username)}</username>
+    <domain>${escapeXml(account.domain)}</domain>
+    <user>${escapeXml(account.user)}</user>
     <password>${escapeXml(account.password)}</password>
     <allowservicelogon>true</allowservicelogon>
   </serviceaccount>` : '';
@@ -146,7 +147,7 @@ function promptHidden(question) {
  * Interactively collect the Windows account the service will run as.
  * Running under the logged-in user (rather than LocalSystem) keeps Chrome and
  * audio-device access working the way they do when CH4C is launched manually.
- * @returns {Promise<{username: string, password: string}>}
+ * @returns {Promise<{domain: string, user: string, password: string}>}
  */
 async function promptServiceAccount() {
   const defaultDomain = process.env.USERDOMAIN || os.hostname();
@@ -157,14 +158,19 @@ async function promptServiceAccount() {
   console.log('Chrome and audio devices behave the same as a manual launch.\n');
 
   const entered = await prompt(`Windows account to run the service as [${defaultAccount}]: `);
-  const username = entered || defaultAccount;
+  const account = entered || defaultAccount;
 
-  const password = await promptHidden(`Password for ${username}: `);
+  // Split DOMAIN\user; a bare name uses the local computer / current domain.
+  const sep = account.indexOf('\\');
+  const domain = sep >= 0 ? account.slice(0, sep) : defaultDomain;
+  const user = sep >= 0 ? account.slice(sep + 1) : account;
+
+  const password = await promptHidden(`Password for ${domain}\\${user}: `);
   if (!password) {
     console.error('\nA password is required to register the service under a user account.');
     process.exit(1);
   }
-  return { username, password };
+  return { domain, user, password };
 }
 
 /**
@@ -194,14 +200,23 @@ async function installWindows(dataDir) {
 
   const runWinSW = (verb) => execSync(`"${winswPath}" ${verb}`, { cwd: serviceDir, stdio: 'pipe' });
 
+  // Clear any previous install so a re-install picks up the new account/config.
+  for (const verb of ['stop', 'uninstall']) {
+    try { runWinSW(verb); } catch { /* nothing to clean up */ }
+  }
+
   try {
     runWinSW('install');
   } catch (error) {
     writeServiceXml(xmlPath, dataDir, null); // never leave the password on disk
-    if (/access is denied|administrator|elevation/i.test(error.message || '')) {
+    const msg = error.message || '';
+    if (/access is denied|administrator|elevation/i.test(msg)) {
       console.error('\nAccess denied. Run this command as Administrator.');
+    } else if (/1072|marked for deletion/i.test(msg)) {
+      console.error('\nThe previous CH4C service is still being removed.');
+      console.error('Close services.msc if it is open, then run: ch4c service install');
     } else {
-      console.error(`\nFailed to register the CH4C service: ${error.message}`);
+      console.error(`\nFailed to register the CH4C service: ${msg}`);
     }
     process.exit(1);
   }
@@ -209,19 +224,28 @@ async function installWindows(dataDir) {
   // SCM now stores the credentials — remove the plaintext password from the XML.
   writeServiceXml(xmlPath, dataDir, null);
 
+  let startError = '';
   try {
     runWinSW('start');
-  } catch {
-    // Service is registered; it can still be started with: ch4c service start
+  } catch (error) {
+    startError = ((error.stderr && error.stderr.toString()) || error.message || '').trim();
   }
 
   console.log(`\nCH4C Windows service installed successfully.`);
   console.log(`  Service name: ${SERVICE_ID} (visible in services.msc)`);
   console.log(`  Startup: Automatic (delayed)`);
-  console.log(`  Runs as: ${account.username}`);
+  console.log(`  Runs as: ${account.domain}\\${account.user}`);
   if (dataDir) console.log(`  Data directory: ${dataDir}`);
   console.log(`  Wrapper: ${winswPath}`);
-  console.log(`\nManage it with: ch4c service start | stop | status | uninstall`);
+
+  if (startError) {
+    console.error(`\nThe service was registered but did not start:`);
+    console.error(`  ${startError.split('\n').join('\n  ')}`);
+    console.error(`\nThis is usually a logon failure — re-check the account name and password,`);
+    console.error(`then run: ch4c service uninstall && ch4c service install`);
+  } else {
+    console.log(`\nThe service is running. Manage it with: ch4c service start | stop | status | uninstall`);
+  }
 }
 
 // ─── macOS helpers ────────────────────────────────────────────────────────────
