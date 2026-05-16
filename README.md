@@ -99,6 +99,7 @@ ch4c service install          # or: node main.js service install if running from
 ```powershell
 powershell -Command "Start-Process cmd -ArgumentList '/k cd /d C:\path\to\CH4C && ch4c service install' -Verb RunAs"
 ```
+Add `--add-to-path` to the install command to put `ch4c.exe` on your PATH, so you can run `ch4c` (e.g. `ch4c service logs`) from any terminal.
 
 **macOS** — installs a launchd agent at `~/Library/LaunchAgents/com.ch4c.plist`. No elevated privileges required:
 ```bash
@@ -112,8 +113,11 @@ ch4c service install -d ~/ch4c-data   # custom data directory
 ch4c service status      # Check if installed and running
 ch4c service start       # Start CH4C
 ch4c service stop        # Stop CH4C gracefully
+ch4c service logs        # Show CH4C's log output (add -f to stream it live)
 ch4c service uninstall   # Remove the service
 ```
+
+Because the service runs hidden with no console window, `ch4c service logs` is how you see CH4C's output. Use `ch4c service logs -f` to watch it live.
 
 > **Default data directory locations:**
 > - **Windows**: `%APPDATA%\ch4c` (e.g. `C:\Users\<user>\AppData\Roaming\ch4c`). If a `data` folder exists in the CH4C install directory it will be used instead for backward compatibility.

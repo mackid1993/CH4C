@@ -234,6 +234,43 @@ async function installWindows(dataDir) {
   }
 }
 
+/**
+ * Append a directory to the current user's PATH (persisted, not just this
+ * session). Returns 'added' or 'present'.
+ * @param {string} dir
+ */
+function addToPath(dir) {
+  const safeDir = dir.replace(/'/g, "''");
+  const ps = `$d='${safeDir}'; $p=[Environment]::GetEnvironmentVariable('Path','User'); `
+    + `if($null -eq $p){$p=''}; if(($p -split ';') -contains $d){'present'}`
+    + `else{[Environment]::SetEnvironmentVariable('Path',($p.TrimEnd(';')+';'+$d).TrimStart(';'),'User');'added'}`;
+  return execSync(`powershell -NoProfile -Command "${ps}"`, { encoding: 'utf8' }).trim();
+}
+
+/**
+ * Add the directory containing ch4c.exe to the user's PATH, so `ch4c` can be
+ * run from any terminal. Only meaningful for the packaged executable.
+ */
+function addExeDirToPath() {
+  const exePath = process.execPath;
+  const isPackaged = path.basename(exePath).toLowerCase().startsWith('ch4c');
+  if (!isPackaged) {
+    console.log(`\n--add-to-path skipped: it only applies to the packaged ch4c.exe.`);
+    return;
+  }
+  const dir = path.dirname(exePath);
+  try {
+    if (addToPath(dir) === 'added') {
+      console.log(`\nAdded to your PATH: ${dir}`);
+      console.log(`Open a new terminal to run "ch4c" from anywhere.`);
+    } else {
+      console.log(`\nAlready on your PATH: ${dir}`);
+    }
+  } catch (error) {
+    console.error(`\nCould not update PATH: ${error.message}`);
+  }
+}
+
 // ─── macOS helpers ────────────────────────────────────────────────────────────
 
 function getMacPlistPath() {
@@ -311,9 +348,11 @@ ${argEntries}
 
 async function install(args) {
   const dataDir = parseDataDir(args);
+  const addPath = args.includes('--add-to-path');
 
   if (process.platform === 'win32') {
     await installWindows(dataDir);
+    if (addPath) addExeDirToPath();
 
   } else if (process.platform === 'darwin') {
     const { plistPath, logPath } = createMacLauncherFiles(dataDir);
@@ -337,6 +376,11 @@ async function install(args) {
     } catch (error) {
       console.error(`Failed to load launch agent: ${error.message}`);
       process.exit(1);
+    }
+
+    if (addPath) {
+      console.log(`\nNote: --add-to-path is a Windows-only option. On macOS, install`);
+      console.log(`CH4C globally with: npm install -g github:dravenst/CH4C`);
     }
 
   } else {
@@ -553,6 +597,75 @@ async function stop() {
   }
 }
 
+// ─── Logs ─────────────────────────────────────────────────────────────────────
+
+/**
+ * Resolve CH4C's data directory — where ch4c.log is written.
+ * Mirrors CH4C's own default (%APPDATA%\ch4c on Windows).
+ * @param {string|null} dataDir - Explicit -d value, if any
+ */
+function getDataDir(dataDir) {
+  if (dataDir) return dataDir;
+  if (process.platform === 'win32') {
+    // CH4C keeps using a legacy ./data folder next to the exe if one exists.
+    const legacy = path.join(path.dirname(process.execPath), 'data');
+    if (fs.existsSync(legacy)) return legacy;
+    return getWindowsServiceDir(null);
+  }
+  return path.join(os.homedir(), 'Library', 'Application Support', 'ch4c');
+}
+
+/** Print the last `maxLines` lines of a text file. */
+function printTail(file, maxLines) {
+  const lines = fs.readFileSync(file, 'utf8').split(/\r?\n/);
+  if (lines.length && lines[lines.length - 1] === '') lines.pop();
+  console.log(lines.slice(-maxLines).join('\n'));
+}
+
+/**
+ * Show CH4C's log output. The service runs hidden, so this is how to see
+ * what CH4C is doing. Pass -f to keep streaming new lines.
+ * @returns {boolean} true if now following the log (caller must not exit)
+ */
+function logs(args) {
+  const dataDir = parseDataDir(args);
+  const follow = args.includes('-f') || args.includes('--follow');
+  const logFile = path.join(getDataDir(dataDir), 'ch4c.log');
+  const serviceLog = process.platform === 'win32'
+    ? path.join(getWindowsServiceDir(dataDir), 'ch4c-service.out.log')
+    : null;
+
+  if (!fs.existsSync(logFile)) {
+    console.log(`\nNo CH4C log found at: ${logFile}`);
+    console.log(`CH4C may not have started yet.`);
+    if (serviceLog && fs.existsSync(serviceLog)) {
+      console.log(`\nService launcher log (${serviceLog}):\n`);
+      printTail(serviceLog, 40);
+    }
+    return false;
+  }
+
+  console.log(`\nCH4C log: ${logFile}\n`);
+  printTail(logFile, 200);
+
+  if (!follow) {
+    if (serviceLog) console.log(`\nService launcher log: ${serviceLog}`);
+    return false;
+  }
+
+  console.log(`\n--- following new output (press Ctrl+C to stop) ---`);
+  let pos = fs.statSync(logFile).size;
+  fs.watchFile(logFile, { interval: 1000 }, (curr) => {
+    if (curr.size < pos) pos = 0; // log was rotated
+    if (curr.size > pos) {
+      const stream = fs.createReadStream(logFile, { start: pos, end: curr.size - 1 });
+      stream.on('data', (chunk) => process.stdout.write(chunk));
+      pos = curr.size;
+    }
+  });
+  return true;
+}
+
 // ─── Usage ────────────────────────────────────────────────────────────────────
 
 function showUsage() {
@@ -560,20 +673,27 @@ function showUsage() {
 Usage: ch4c service <command> [options]
 
 Commands:
-  install [-d <path>]  Install CH4C as a service that starts automatically
+  install [-d <path>] [--add-to-path]
+                       Install CH4C as a service that starts automatically
                        Use -d to specify a custom data directory
+                       Use --add-to-path to add ch4c.exe to your PATH (Windows)
   uninstall            Remove the CH4C service
   status               Check if the service is installed and running
   start                Start the CH4C service
   stop                 Stop the CH4C service
+  logs [-d <path>] [-f]
+                       Show CH4C's log output (the service runs hidden)
+                       Use -f to stream new output live
 
 Examples (Windows):
   ch4c service install
-  ch4c service install -d C:\\ch4c-data
+  ch4c service install -d C:\\ch4c-data --add-to-path
+  ch4c service logs -f
 
 Examples (macOS):
   ch4c service install
   ch4c service install -d ~/ch4c-data
+  ch4c service logs
 `);
 }
 
@@ -596,6 +716,11 @@ async function handleServiceCommand(args) {
     case 'stop':
       await stop();
       break;
+    case 'logs': {
+      const following = logs(args.slice(1));
+      if (following) return; // stay alive to stream the log
+      break;
+    }
     default:
       showUsage();
       break;
