@@ -5,7 +5,6 @@ const fs = require('fs');
 const http = require('http');
 const os = require('os');
 const path = require('path');
-const readline = require('readline');
 
 const SERVICE_ID = 'CH4C';
 const MAC_LABEL = 'com.ch4c';
@@ -83,30 +82,27 @@ function resolveServiceTarget(dataDir) {
 }
 
 /**
- * Write the WinSW XML config. When `account` is provided the service is
- * registered to run as that user; those credentials are written only for the
- * install call and stripped immediately afterwards (see installWindows).
+ * Write the WinSW XML config. The service itself runs as LocalSystem — the
+ * default — so it holds the privilege needed to launch CH4C into the
+ * interactive user's session (see ch4c-launcher.cs). The wrapped executable
+ * is therefore the launcher, not CH4C directly.
  * @param {string} xmlPath
+ * @param {string} launcherExe - Path to the compiled ch4c-launcher.exe
  * @param {string|null} dataDir
- * @param {{username: string, password: string}|null} account
  */
-function writeServiceXml(xmlPath, dataDir, account) {
+function writeServiceXml(xmlPath, launcherExe, dataDir) {
   const { executable, args, workingDir } = resolveServiceTarget(dataDir);
 
-  const accountBlock = account ? `
-  <serviceaccount>
-    <domain>${escapeXml(account.domain)}</domain>
-    <user>${escapeXml(account.user)}</user>
-    <password>${escapeXml(account.password)}</password>
-    <allowservicelogon>true</allowservicelogon>
-  </serviceaccount>` : '';
+  // The launcher receives CH4C's command line as its own arguments.
+  const ch4cCommand = (executable.includes(' ') ? `"${executable}"` : executable)
+    + (args ? ` ${args}` : '');
 
   const xml = `<service>
   <id>${SERVICE_ID}</id>
   <name>CH4C - Chrome HDMI for Channels</name>
   <description>Chrome HDMI for Channels DVR - captures web streams via Chrome for Channels DVR.</description>
-  <executable>${escapeXml(executable)}</executable>
-  <arguments>${escapeXml(args)}</arguments>
+  <executable>${escapeXml(launcherExe)}</executable>
+  <arguments>${escapeXml(ch4cCommand)}</arguments>
   <workingdirectory>${escapeXml(workingDir)}</workingdirectory>
   <startmode>Automatic</startmode>
   <delayedAutoStart/>
@@ -114,67 +110,53 @@ function writeServiceXml(xmlPath, dataDir, account) {
   <log mode="roll-by-size">
     <sizeThreshold>10240</sizeThreshold>
     <keepFiles>3</keepFiles>
-  </log>${accountBlock}
+  </log>
 </service>
 `;
   fs.writeFileSync(xmlPath, xml, 'utf8');
 }
 
-/** Prompt for a line of input on the console. */
-function prompt(question) {
-  return new Promise((resolve) => {
-    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-    rl.question(question, (answer) => { rl.close(); resolve(answer.trim()); });
-  });
-}
-
-/** Prompt for a line of input, masking the typed characters. */
-function promptHidden(question) {
-  return new Promise((resolve) => {
-    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-    rl._writeToOutput = (str) => {
-      process.stdout.write(str.includes(question) ? question : '*');
-    };
-    rl.question(question, (answer) => {
-      rl.close();
-      process.stdout.write('\n');
-      resolve(answer);
-    });
-  });
+/**
+ * Locate the .NET Framework C# compiler. csc.exe ships with the .NET
+ * Framework 4.x runtime, which is present on every supported Windows release.
+ * @returns {string|null}
+ */
+function findCsc() {
+  const winDir = process.env.WINDIR || 'C:\\Windows';
+  const candidates = [
+    path.join(winDir, 'Microsoft.NET', 'Framework64', 'v4.0.30319', 'csc.exe'),
+    path.join(winDir, 'Microsoft.NET', 'Framework', 'v4.0.30319', 'csc.exe'),
+  ];
+  return candidates.find(fs.existsSync) || null;
 }
 
 /**
- * Interactively collect the Windows account the service will run as.
- * Running under the logged-in user (rather than LocalSystem) keeps Chrome and
- * audio-device access working the way they do when CH4C is launched manually.
- * @returns {Promise<{domain: string, user: string, password: string}>}
+ * Copy ch4c-launcher.cs into the service directory and compile it to an exe.
+ * Done at install time so the service ships no prebuilt binaries.
+ * @param {string} serviceDir
+ * @returns {string} - Path to the compiled ch4c-launcher.exe
  */
-async function promptServiceAccount() {
-  const defaultDomain = process.env.USERDOMAIN || os.hostname();
-  const defaultUser = process.env.USERNAME || os.userInfo().username;
-  const defaultAccount = `${defaultDomain}\\${defaultUser}`;
-
-  console.log('\nCH4C runs as a Windows service under your user account so that');
-  console.log('Chrome and audio devices behave the same as a manual launch.\n');
-
-  const entered = await prompt(`Windows account to run the service as [${defaultAccount}]: `);
-  const account = entered || defaultAccount;
-
-  // Split DOMAIN\user; a bare name uses the local computer / current domain.
-  const sep = account.indexOf('\\');
-  const domain = sep >= 0 ? account.slice(0, sep) : defaultDomain;
-  const user = sep >= 0 ? account.slice(sep + 1) : account;
-
-  const password = await promptHidden(`Password for ${domain}\\${user}: `);
-  if (!password) {
-    console.error('\nA password is required to register the service under a user account.');
-    process.exit(1);
+function compileLauncher(serviceDir) {
+  const csc = findCsc();
+  if (!csc) {
+    throw new Error('Could not find the C# compiler (csc.exe). '
+      + 'The .NET Framework 4.x runtime is required to install the CH4C service.');
   }
-  return { domain, user, password };
+  const srcPath = path.join(serviceDir, 'ch4c-launcher.cs');
+  const exePath = path.join(serviceDir, 'ch4c-launcher.exe');
+  fs.writeFileSync(srcPath, fs.readFileSync(path.join(__dirname, 'ch4c-launcher.cs')));
+  execSync(`"${csc}" /nologo /optimize+ /target:exe /out:"${exePath}" "${srcPath}"`, { stdio: 'pipe' });
+  return exePath;
 }
 
 /**
  * Register CH4C as a Windows service via the WinSW wrapper.
+ *
+ * The service runs as LocalSystem and its job is to launch CH4C into the
+ * logged-in user's interactive session with a de-elevated token — a Windows
+ * service cannot run Chrome itself (it has no desktop, and CH4C refuses to
+ * start elevated). No account or password is needed: LocalSystem already
+ * holds the privilege required to spawn into the user's session.
  * @param {string|null} dataDir
  */
 async function installWindows(dataDir) {
@@ -195,12 +177,21 @@ async function installWindows(dataDir) {
     }
   }
 
-  const account = await promptServiceAccount();
-  writeServiceXml(xmlPath, dataDir, account);
+  let launcherExe;
+  try {
+    console.log('Building the CH4C session launcher...');
+    launcherExe = compileLauncher(serviceDir);
+  } catch (error) {
+    const detail = ((error.stderr && error.stderr.toString()) || error.message || '').trim();
+    console.error(`\nFailed to build the session launcher:\n  ${detail.split('\n').join('\n  ')}`);
+    process.exit(1);
+  }
+
+  writeServiceXml(xmlPath, launcherExe, dataDir);
 
   const runWinSW = (verb) => execSync(`"${winswPath}" ${verb}`, { cwd: serviceDir, stdio: 'pipe' });
 
-  // Clear any previous install so a re-install picks up the new account/config.
+  // Clear any previous install so a re-install picks up the new config.
   for (const verb of ['stop', 'uninstall']) {
     try { runWinSW(verb); } catch { /* nothing to clean up */ }
   }
@@ -208,7 +199,6 @@ async function installWindows(dataDir) {
   try {
     runWinSW('install');
   } catch (error) {
-    writeServiceXml(xmlPath, dataDir, null); // never leave the password on disk
     const msg = error.message || '';
     if (/access is denied|administrator|elevation/i.test(msg)) {
       console.error('\nAccess denied. Run this command as Administrator.');
@@ -221,9 +211,6 @@ async function installWindows(dataDir) {
     process.exit(1);
   }
 
-  // SCM now stores the credentials — remove the plaintext password from the XML.
-  writeServiceXml(xmlPath, dataDir, null);
-
   let startError = '';
   try {
     runWinSW('start');
@@ -234,17 +221,16 @@ async function installWindows(dataDir) {
   console.log(`\nCH4C Windows service installed successfully.`);
   console.log(`  Service name: ${SERVICE_ID} (visible in services.msc)`);
   console.log(`  Startup: Automatic (delayed)`);
-  console.log(`  Runs as: ${account.domain}\\${account.user}`);
+  console.log(`  Runs CH4C as: the logged-in user, in their interactive session`);
   if (dataDir) console.log(`  Data directory: ${dataDir}`);
-  console.log(`  Wrapper: ${winswPath}`);
+  console.log(`  Files: ${serviceDir}`);
 
   if (startError) {
     console.error(`\nThe service was registered but did not start:`);
     console.error(`  ${startError.split('\n').join('\n  ')}`);
-    console.error(`\nThis is usually a logon failure — re-check the account name and password,`);
-    console.error(`then run: ch4c service uninstall && ch4c service install`);
   } else {
-    console.log(`\nThe service is running. Manage it with: ch4c service start | stop | status | uninstall`);
+    console.log(`\nThe service is running. CH4C starts whenever a user is logged in.`);
+    console.log(`Manage it with: ch4c service start | stop | status | uninstall`);
   }
 }
 
@@ -380,10 +366,11 @@ function uninstall(args) {
       console.log(`\nCH4C Windows service is not installed.`);
     }
 
-    // Best-effort cleanup of the WinSW wrapper files.
+    // Best-effort cleanup of the WinSW wrapper and launcher files.
     if (removed) {
       const serviceDir = getWindowsServiceDir(parseDataDir(args || []));
-      for (const file of ['ch4c-service.exe', 'ch4c-service.xml']) {
+      const files = ['ch4c-service.exe', 'ch4c-service.xml', 'ch4c-launcher.exe', 'ch4c-launcher.cs'];
+      for (const file of files) {
         try { fs.unlinkSync(path.join(serviceDir, file)); } catch { /* ignore */ }
       }
     }
@@ -534,20 +521,25 @@ async function stop() {
   const port = getCH4CPort();
   const graceful = await requestGracefulShutdown(port);
 
+  if (process.platform === 'win32') {
+    // A graceful request lets CH4C close Chrome cleanly, but the launcher
+    // service would immediately restart it — so the service must be stopped.
+    if (graceful) console.log(`\nCH4C is shutting down gracefully...`);
+    try {
+      execSync(`sc stop ${SERVICE_ID}`, { stdio: 'pipe' });
+      console.log(`\nCH4C Windows service stopped.`);
+    } catch {
+      if (!graceful) console.log(`\nCH4C Windows service is not currently running.`);
+    }
+    return;
+  }
+
   if (graceful) {
     console.log(`\nCH4C is shutting down gracefully...`);
     return;
   }
 
-  if (process.platform === 'win32') {
-    try {
-      execSync(`sc stop ${SERVICE_ID}`, { stdio: 'pipe' });
-      console.log(`\nCH4C Windows service stopped.`);
-    } catch {
-      console.log(`\nCH4C Windows service is not currently running.`);
-    }
-
-  } else if (process.platform === 'darwin') {
+  if (process.platform === 'darwin') {
     try {
       execSync(`launchctl stop ${MAC_LABEL}`, { stdio: 'pipe' });
       console.log(`\nCH4C launch agent stopped.`);
