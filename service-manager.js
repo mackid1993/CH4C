@@ -5,9 +5,15 @@ const fs = require('fs');
 const http = require('http');
 const os = require('os');
 const path = require('path');
+const readline = require('readline');
 
-const TASK_NAME = 'CH4C';
+const SERVICE_ID = 'CH4C';
 const MAC_LABEL = 'com.ch4c';
+
+// WinSW (Windows Service Wrapper) — turns CH4C into a real Windows service
+// registered with the Service Control Manager (visible in services.msc).
+const WINSW_VERSION = 'v2.12.0';
+const WINSW_URL = `https://github.com/winsw/winsw/releases/download/${WINSW_VERSION}/WinSW-x64.exe`;
 
 /**
  * Parse -d or --data-dir from install arguments.
@@ -27,36 +33,195 @@ function parseDataDir(args) {
 // ─── Windows helpers ──────────────────────────────────────────────────────────
 
 /**
- * Create a launcher batch file that the scheduled task will run.
- * This avoids nested quote issues with schtasks /TR.
- * @param {string|null} dataDir - Optional data directory to pass via -d flag
- * @returns {{ launcherPath: string, workingDir: string }}
+ * Resolve the directory that holds the WinSW wrapper, its XML config and logs.
+ * Uses the -d data directory when given, otherwise CH4C's default %APPDATA%\ch4c.
+ * @param {string|null} dataDir
+ * @returns {string}
  */
-function createLauncherScript(dataDir) {
+function getWindowsServiceDir(dataDir) {
+  if (dataDir) return dataDir;
+  const appData = process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming');
+  return path.join(appData, 'ch4c');
+}
+
+/** Escape a string for safe inclusion in XML text content. */
+function escapeXml(value) {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
+/**
+ * Download the WinSW wrapper executable to destPath.
+ * Done once per machine on first install; cached alongside the XML config.
+ */
+async function downloadWinSW(destPath) {
+  const fetch = require('node-fetch');
+  const res = await fetch(WINSW_URL);
+  if (!res.ok) throw new Error(`HTTP ${res.status} from ${WINSW_URL}`);
+  fs.writeFileSync(destPath, await res.buffer());
+}
+
+/**
+ * Resolve how the service should launch CH4C (packaged exe vs. node + main.js).
+ * @param {string|null} dataDir
+ * @returns {{ executable: string, args: string, workingDir: string }}
+ */
+function resolveServiceTarget(dataDir) {
   const exePath = process.execPath;
   const isPackaged = path.basename(exePath).toLowerCase().startsWith('ch4c');
-  const dataDirFlag = dataDir ? ` -d "${dataDir}"` : '';
+  const dataDirArg = dataDir ? ` -d "${dataDir}"` : '';
 
-  let workingDir, runCommand;
   if (isPackaged) {
-    workingDir = path.dirname(exePath);
-    runCommand = `"${exePath}"${dataDirFlag}`;
-  } else {
-    const mainScript = path.join(__dirname, 'main.js');
-    workingDir = __dirname;
-    runCommand = `"${exePath}" "${mainScript}"${dataDirFlag}`;
+    return { executable: exePath, args: dataDirArg.trim(), workingDir: path.dirname(exePath) };
+  }
+  const mainScript = path.join(__dirname, 'main.js');
+  return { executable: exePath, args: `"${mainScript}"${dataDirArg}`, workingDir: __dirname };
+}
+
+/**
+ * Write the WinSW XML config. When `account` is provided the service is
+ * registered to run as that user; those credentials are written only for the
+ * install call and stripped immediately afterwards (see installWindows).
+ * @param {string} xmlPath
+ * @param {string|null} dataDir
+ * @param {{username: string, password: string}|null} account
+ */
+function writeServiceXml(xmlPath, dataDir, account) {
+  const { executable, args, workingDir } = resolveServiceTarget(dataDir);
+
+  const accountBlock = account ? `
+  <serviceaccount>
+    <username>${escapeXml(account.username)}</username>
+    <password>${escapeXml(account.password)}</password>
+    <allowservicelogon>true</allowservicelogon>
+  </serviceaccount>` : '';
+
+  const xml = `<service>
+  <id>${SERVICE_ID}</id>
+  <name>CH4C - Chrome HDMI for Channels</name>
+  <description>Chrome HDMI for Channels DVR - captures web streams via Chrome for Channels DVR.</description>
+  <executable>${escapeXml(executable)}</executable>
+  <arguments>${escapeXml(args)}</arguments>
+  <workingdirectory>${escapeXml(workingDir)}</workingdirectory>
+  <startmode>Automatic</startmode>
+  <delayedAutoStart/>
+  <onfailure action="restart" delay="15 sec"/>
+  <log mode="roll-by-size">
+    <sizeThreshold>10240</sizeThreshold>
+    <keepFiles>3</keepFiles>
+  </log>${accountBlock}
+</service>
+`;
+  fs.writeFileSync(xmlPath, xml, 'utf8');
+}
+
+/** Prompt for a line of input on the console. */
+function prompt(question) {
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    rl.question(question, (answer) => { rl.close(); resolve(answer.trim()); });
+  });
+}
+
+/** Prompt for a line of input, masking the typed characters. */
+function promptHidden(question) {
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    rl._writeToOutput = (str) => {
+      process.stdout.write(str.includes(question) ? question : '*');
+    };
+    rl.question(question, (answer) => {
+      rl.close();
+      process.stdout.write('\n');
+      resolve(answer);
+    });
+  });
+}
+
+/**
+ * Interactively collect the Windows account the service will run as.
+ * Running under the logged-in user (rather than LocalSystem) keeps Chrome and
+ * audio-device access working the way they do when CH4C is launched manually.
+ * @returns {Promise<{username: string, password: string}>}
+ */
+async function promptServiceAccount() {
+  const defaultDomain = process.env.USERDOMAIN || os.hostname();
+  const defaultUser = process.env.USERNAME || os.userInfo().username;
+  const defaultAccount = `${defaultDomain}\\${defaultUser}`;
+
+  console.log('\nCH4C runs as a Windows service under your user account so that');
+  console.log('Chrome and audio devices behave the same as a manual launch.\n');
+
+  const entered = await prompt(`Windows account to run the service as [${defaultAccount}]: `);
+  const username = entered || defaultAccount;
+
+  const password = await promptHidden(`Password for ${username}: `);
+  if (!password) {
+    console.error('\nA password is required to register the service under a user account.');
+    process.exit(1);
+  }
+  return { username, password };
+}
+
+/**
+ * Register CH4C as a Windows service via the WinSW wrapper.
+ * @param {string|null} dataDir
+ */
+async function installWindows(dataDir) {
+  const serviceDir = getWindowsServiceDir(dataDir);
+  fs.mkdirSync(serviceDir, { recursive: true });
+
+  const winswPath = path.join(serviceDir, 'ch4c-service.exe');
+  const xmlPath = path.join(serviceDir, 'ch4c-service.xml');
+
+  if (!fs.existsSync(winswPath)) {
+    console.log('Downloading the Windows service wrapper (WinSW)...');
+    try {
+      await downloadWinSW(winswPath);
+    } catch (error) {
+      console.error(`\nFailed to download the service wrapper: ${error.message}`);
+      console.error('Check your internet connection and try again.');
+      process.exit(1);
+    }
   }
 
-  const launcherDir = dataDir || path.join(workingDir, 'data');
-  if (!fs.existsSync(launcherDir)) {
-    fs.mkdirSync(launcherDir, { recursive: true });
+  const account = await promptServiceAccount();
+  writeServiceXml(xmlPath, dataDir, account);
+
+  const runWinSW = (verb) => execSync(`"${winswPath}" ${verb}`, { cwd: serviceDir, stdio: 'pipe' });
+
+  try {
+    runWinSW('install');
+  } catch (error) {
+    writeServiceXml(xmlPath, dataDir, null); // never leave the password on disk
+    if (/access is denied|administrator|elevation/i.test(error.message || '')) {
+      console.error('\nAccess denied. Run this command as Administrator.');
+    } else {
+      console.error(`\nFailed to register the CH4C service: ${error.message}`);
+    }
+    process.exit(1);
   }
 
-  const launcherPath = path.join(launcherDir, 'ch4c-launcher.cmd');
-  const script = `@echo off\r\ntimeout /t 30 /nobreak >nul\r\ncd /d "${workingDir}"\r\n${runCommand}\r\n`;
-  fs.writeFileSync(launcherPath, script);
+  // SCM now stores the credentials — remove the plaintext password from the XML.
+  writeServiceXml(xmlPath, dataDir, null);
 
-  return { launcherPath, workingDir };
+  try {
+    runWinSW('start');
+  } catch {
+    // Service is registered; it can still be started with: ch4c service start
+  }
+
+  console.log(`\nCH4C Windows service installed successfully.`);
+  console.log(`  Service name: ${SERVICE_ID} (visible in services.msc)`);
+  console.log(`  Startup: Automatic (delayed)`);
+  console.log(`  Runs as: ${account.username}`);
+  if (dataDir) console.log(`  Data directory: ${dataDir}`);
+  console.log(`  Wrapper: ${winswPath}`);
+  console.log(`\nManage it with: ch4c service start | stop | status | uninstall`);
 }
 
 // ─── macOS helpers ────────────────────────────────────────────────────────────
@@ -134,35 +299,11 @@ ${argEntries}
 
 // ─── Commands ─────────────────────────────────────────────────────────────────
 
-function install(args) {
+async function install(args) {
   const dataDir = parseDataDir(args);
 
   if (process.platform === 'win32') {
-    const { launcherPath } = createLauncherScript(dataDir);
-
-    try {
-      execSync(`schtasks /Delete /TN "${TASK_NAME}" /F`, { stdio: 'pipe' });
-    } catch {
-      // Ignore if task doesn't exist
-    }
-
-    const createCmd = `schtasks /Create /TN "${TASK_NAME}" /TR "\\"${launcherPath}\\"" /SC ONLOGON /F`;
-    try {
-      execSync(createCmd, { stdio: 'pipe' });
-      console.log(`\nCH4C scheduled task installed successfully.`);
-      console.log(`  Task name: ${TASK_NAME}`);
-      console.log(`  Trigger: At user logon (with 30 second delay)`);
-      if (dataDir) console.log(`  Data directory: ${dataDir}`);
-      console.log(`  Launcher: ${launcherPath}`);
-      console.log(`\nCH4C will start automatically when you log in.`);
-    } catch (error) {
-      if (error.message && error.message.includes('Access is denied')) {
-        console.error(`\nAccess denied. Run this command as Administrator.`);
-      } else {
-        console.error(`Failed to create scheduled task: ${error.message}`);
-      }
-      process.exit(1);
-    }
+    await installWindows(dataDir);
 
   } else if (process.platform === 'darwin') {
     const { plistPath, logPath } = createMacLauncherFiles(dataDir);
@@ -194,17 +335,33 @@ function install(args) {
   }
 }
 
-function uninstall() {
+function uninstall(args) {
   if (process.platform === 'win32') {
     try {
-      execSync(`schtasks /Delete /TN "${TASK_NAME}" /F`, { stdio: 'pipe' });
-      console.log(`\nCH4C scheduled task removed successfully.`);
+      execSync(`sc stop ${SERVICE_ID}`, { stdio: 'pipe' });
+    } catch {
+      // Not running — fine
+    }
+
+    let removed = false;
+    try {
+      execSync(`sc delete ${SERVICE_ID}`, { stdio: 'pipe' });
+      console.log(`\nCH4C Windows service removed successfully.`);
+      removed = true;
     } catch (error) {
       if (error.message && error.message.includes('Access is denied')) {
         console.error(`\nAccess denied. Run this command as Administrator.`);
         process.exit(1);
       }
-      console.log(`\nCH4C scheduled task is not installed.`);
+      console.log(`\nCH4C Windows service is not installed.`);
+    }
+
+    // Best-effort cleanup of the WinSW wrapper files.
+    if (removed) {
+      const serviceDir = getWindowsServiceDir(parseDataDir(args || []));
+      for (const file of ['ch4c-service.exe', 'ch4c-service.xml']) {
+        try { fs.unlinkSync(path.join(serviceDir, file)); } catch { /* ignore */ }
+      }
     }
 
   } else if (process.platform === 'darwin') {
@@ -232,8 +389,8 @@ function uninstall() {
 function status() {
   if (process.platform === 'win32') {
     try {
-      const result = execSync(`schtasks /Query /TN "${TASK_NAME}" /FO CSV /NH`, { encoding: 'utf8', stdio: 'pipe' });
-      const isRunning = result.includes('Running');
+      const result = execSync(`sc query ${SERVICE_ID}`, { encoding: 'utf8', stdio: 'pipe' });
+      const isRunning = /STATE\s*:\s*\d+\s+RUNNING/i.test(result);
       console.log(`\nCH4C service status:`);
       console.log(`  Installed: Yes`);
       console.log(`  Running: ${isRunning ? 'Yes' : 'No'}`);
@@ -269,11 +426,15 @@ function status() {
 function start() {
   if (process.platform === 'win32') {
     try {
-      execSync(`schtasks /Run /TN "${TASK_NAME}"`, { stdio: 'pipe' });
-      console.log(`\nCH4C scheduled task started.`);
-    } catch {
-      console.error(`Failed to start CH4C task. Is it installed? Run: ch4c service install`);
-      process.exit(1);
+      execSync(`sc start ${SERVICE_ID}`, { stdio: 'pipe' });
+      console.log(`\nCH4C Windows service started.`);
+    } catch (error) {
+      if (error.message && error.message.includes('1056')) {
+        console.log(`\nCH4C Windows service is already running.`);
+      } else {
+        console.error(`Failed to start CH4C service. Is it installed? Run: ch4c service install`);
+        process.exit(1);
+      }
     }
 
   } else if (process.platform === 'darwin') {
@@ -356,10 +517,10 @@ async function stop() {
 
   if (process.platform === 'win32') {
     try {
-      execSync(`schtasks /End /TN "${TASK_NAME}"`, { stdio: 'pipe' });
-      console.log(`\nCH4C scheduled task stopped.`);
+      execSync(`sc stop ${SERVICE_ID}`, { stdio: 'pipe' });
+      console.log(`\nCH4C Windows service stopped.`);
     } catch {
-      console.log(`\nCH4C task is not currently running.`);
+      console.log(`\nCH4C Windows service is not currently running.`);
     }
 
   } else if (process.platform === 'darwin') {
@@ -383,7 +544,7 @@ function showUsage() {
 Usage: ch4c service <command> [options]
 
 Commands:
-  install [-d <path>]  Install CH4C as a service that starts at login
+  install [-d <path>]  Install CH4C as a service that starts automatically
                        Use -d to specify a custom data directory
   uninstall            Remove the CH4C service
   status               Check if the service is installed and running
@@ -405,10 +566,10 @@ async function handleServiceCommand(args) {
 
   switch (subcommand) {
     case 'install':
-      install(args.slice(1));
+      await install(args.slice(1));
       break;
     case 'uninstall':
-      uninstall();
+      uninstall(args.slice(1));
       break;
     case 'status':
       status();
