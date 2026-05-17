@@ -15,24 +15,23 @@ class AudioDeviceManager {
     this.platform = os.platform();
     this.cachedDevices = null;
     this.moduleAvailable = null; // null = unknown, true = Get-AudioDevice worked, false = not installed
+    this.cacheTimeout = 60000;
+    this.lastCacheTime = 0;
   }
 
   /**
-   * Main entry point - gets audio devices with multiple fallback methods.
-   * Audio hardware rarely changes, so the result is cached for the life of the
-   * process after the first successful detection - the PowerShell probe (which
-   * recursively scans the filesystem) then runs once at startup instead of on
-   * every browser launch/recovery. The settings UI passes forceRefresh to
-   * re-detect after the user changes audio hardware.
+   * Main entry point - gets audio devices with multiple fallback methods
    */
-  async getAudioDevices(forceRefresh = false) {
-    if (this.cachedDevices && !forceRefresh) {
+  async getAudioDevices() {
+    const now = Date.now();
+    if (this.cachedDevices && (now - this.lastCacheTime) < this.cacheTimeout) {
       return this.cachedDevices;
     }
 
     if (this.platform === 'darwin') {
       const devices = await this.getMacAudioDevices();
       this.cachedDevices = devices;
+      this.lastCacheTime = now;
       return devices;
     }
 
@@ -51,6 +50,7 @@ class AudioDeviceManager {
         const devices = await method();
         if (devices && devices.length > 0) {
           this.cachedDevices = devices;
+          this.lastCacheTime = now;
           return devices;
         }
       } catch (error) {
@@ -849,16 +849,11 @@ class DisplayManager {
   }
 }
 
-// Shared instance - audio devices are detected once at startup and reused
-// process-wide so the PowerShell probe is not respawned per browser launch.
-const audioDeviceManager = new AudioDeviceManager();
-
 // Export
 module.exports = {
   AudioDeviceManager,
   DisplayManager,
-  testAudioDevices,
-  audioDeviceManager
+  testAudioDevices
 };
 
 // Run test if this file is executed directly

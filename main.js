@@ -34,7 +34,7 @@ const {
   initializeBrowserPoolWithValidation
 } = require('./error-handling');
 
-const { DisplayManager, audioDeviceManager } = require('./audio-device-manager');
+const { AudioDeviceManager, DisplayManager } = require('./audio-device-manager');
 const { CONFIG_METADATA, ENCODER_FIELDS, validateAllSettings, validateEncoder, saveConfig, loadConfig, getDefaults } = require('./config-manager');
 const { LOGIN_SITES, loginEncoders, loginSling } = require('./login-manager');
 const credentialsStore = require('./credentials-store');
@@ -4066,18 +4066,6 @@ async function launchBrowser(targetUrl, encoderConfig, startMinimized, applyStar
       '--disable-background-timer-throttling',
       '--disable-background-media-suspend',
       '--disable-backgrounding-occluded-windows',
-      // Stop Chrome lowering the renderer process priority when the capture
-      // window isn't the OS foreground window (the renderer runs the software
-      // video decode); pairs with the --disable-background-* flags above.
-      '--disable-renderer-backgrounding',
-      // Disable Windows native-window occlusion tracking - a documented source
-      // of periodic jank/lock contention, and pure overhead for a capture
-      // window that is never occluded - plus assorted idle telemetry/discovery
-      // features (Cast/DIAL polling, optimization-hint downloads, etc.).
-      '--disable-features=CalculateNativeWinOcclusion,Translate,OptimizationHints,OptimizationGuideModelDownloading,MediaRouter,DialMediaRouteProvider,InterestFeedContentSuggestions,AutofillServerCommunication,CertificateTransparencyComponentUpdater',
-      // No crash reporter needed - CH4C has its own browser-crash recovery.
-      '--disable-breakpad',
-      '--disable-crash-reporter',
     ];
 
     if (applyStartFullScreenArg) {
@@ -4093,7 +4081,8 @@ async function launchBrowser(targetUrl, encoderConfig, startMinimized, applyStar
     // Add audio configuration if device specified
     // Validate audio device before adding to launch args
     if (encoderConfig.audioDevice) {
-      const result = await audioDeviceManager.validateDevice(encoderConfig.audioDevice);
+      const audioManager = new AudioDeviceManager();
+      const result = await audioManager.validateDevice(encoderConfig.audioDevice);
       
       if (result.valid) {
         launchArgs.push(
@@ -4504,14 +4493,7 @@ async function setupAudioMonitor(frameHandle, videoHandle, audioDevice, encoderU
       video.__audioMonitorActive = true;
 
       // Check and re-apply audio every 15 seconds
-      const audioMonitorId = setInterval(async () => {
-        // The site can swap out the <video> element mid-stream (ads, quality
-        // changes); self-terminate so this interval doesn't leak and keep
-        // calling enumerateDevices() on a detached element forever.
-        if (!video.isConnected) {
-          clearInterval(audioMonitorId);
-          return;
-        }
+      setInterval(async () => {
         try {
           const currentSinkId = video.sinkId;
 
@@ -4554,12 +4536,6 @@ async function setupAudioMonitor(frameHandle, videoHandle, audioDevice, encoderU
 function setupESPNErrorMonitor(page, encoderConfig = null) {
   if (!Constants.ENABLE_PAUSE_MONITOR) {
     return;
-  }
-
-  // The browser page is pooled and reused across tunes; clear any monitor still
-  // running from a previous stream so intervals don't accumulate on this page.
-  if (page.__ch4cESPNMonitorId) {
-    clearInterval(page.__ch4cESPNMonitorId);
   }
 
   const url = page.url();
@@ -4628,8 +4604,6 @@ function setupESPNErrorMonitor(page, encoderConfig = null) {
     }
   }, CHECK_INTERVAL_MS);
 
-  page.__ch4cESPNMonitorId = intervalId;
-
   logTS(`ESPN error recovery monitor active (${CHECK_INTERVAL_MS / 1000}s interval, max ${MAX_RECOVERY_ATTEMPTS} recoveries)`);
 }
 
@@ -4646,18 +4620,13 @@ async function setupPauseMonitor(frameHandle, videoHandle, page) {
   }
 
   try {
-    // Forward browser console messages to Node.js console (only [CH4C] tagged messages).
-    // The page is pooled and setupPauseMonitor runs once per tune, so guard against
-    // attaching a duplicate listener every time this page is reused for a new stream.
-    if (!page.__ch4cConsoleHooked) {
-      page.__ch4cConsoleHooked = true;
-      page.on('console', msg => {
-        const text = msg.text();
-        if (text.startsWith('[CH4C]')) {
-          logTS(text);
-        }
-      });
-    }
+    // Forward browser console messages to Node.js console (only [CH4C] tagged messages)
+    page.on('console', msg => {
+      const text = msg.text();
+      if (text.startsWith('[CH4C]')) {
+        logTS(text);
+      }
+    });
 
     await frameHandle.evaluate((video, intervalSeconds) => {
       // Prevent multiple monitors on the same video
@@ -4666,13 +4635,7 @@ async function setupPauseMonitor(frameHandle, videoHandle, page) {
       }
       video.__pauseMonitorActive = true;
 
-      const pauseMonitorId = setInterval(() => {
-        // Self-terminate if the site swapped out this <video> element, so the
-        // interval doesn't leak on a detached element.
-        if (!video.isConnected) {
-          clearInterval(pauseMonitorId);
-          return;
-        }
+      setInterval(() => {
         if (video.paused && !video.ended) {
           console.log('[CH4C] Video paused - attempting to resume...');
           video.play().catch(err => {
@@ -7964,8 +7927,9 @@ ${processInfo && processInfo.pid !== 'Unknown' ?
 
   // Log available audio devices at startup
   try {
-    const detectedDevices = await audioDeviceManager.getAudioDevices();
-    if (audioDeviceManager.moduleAvailable === false) {
+    const startupAudioManager = new AudioDeviceManager();
+    const detectedDevices = await startupAudioManager.getAudioDevices();
+    if (startupAudioManager.moduleAvailable === false) {
       logTS('WARNING: AudioDeviceCmdlets PowerShell module not installed. Some audio devices may not be detected.');
       logTS('To install, run in Administrator PowerShell: Install-Module -Name AudioDeviceCmdlets -Force');
     }
@@ -8522,8 +8486,9 @@ ${processInfo && processInfo.pid !== 'Unknown' ?
   });
 
   app.get('/audio-devices', async (req, res) => {
-    const devices = await audioDeviceManager.getAudioDevices(true);
-    res.json({ devices, moduleAvailable: audioDeviceManager.moduleAvailable });
+    const audioManager = new AudioDeviceManager();
+    const devices = await audioManager.getAudioDevices();
+    res.json({ devices, moduleAvailable: audioManager.moduleAvailable });
   });
 
   // GET /displays - Get display/monitor configuration
