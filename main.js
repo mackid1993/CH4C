@@ -4492,7 +4492,14 @@ async function setupAudioMonitor(frameHandle, videoHandle, audioDevice, encoderU
       video.__audioMonitorActive = true;
 
       // Check and re-apply audio every 15 seconds
-      setInterval(async () => {
+      const audioMonitorId = setInterval(async () => {
+        // The site can swap out the <video> element mid-stream (ads, quality
+        // changes); self-terminate so this interval doesn't leak and keep
+        // calling enumerateDevices() on a detached element forever.
+        if (!video.isConnected) {
+          clearInterval(audioMonitorId);
+          return;
+        }
         try {
           const currentSinkId = video.sinkId;
 
@@ -4647,7 +4654,13 @@ async function setupPauseMonitor(frameHandle, videoHandle, page) {
       }
       video.__pauseMonitorActive = true;
 
-      setInterval(() => {
+      const pauseMonitorId = setInterval(() => {
+        // Self-terminate if the site swapped out this <video> element, so the
+        // interval doesn't leak on a detached element.
+        if (!video.isConnected) {
+          clearInterval(pauseMonitorId);
+          return;
+        }
         if (video.paused && !video.ended) {
           console.log('[CH4C] Video paused - attempting to resume...');
           video.play().catch(err => {
