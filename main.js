@@ -34,7 +34,7 @@ const {
   initializeBrowserPoolWithValidation
 } = require('./error-handling');
 
-const { AudioDeviceManager, DisplayManager } = require('./audio-device-manager');
+const { DisplayManager, audioDeviceManager } = require('./audio-device-manager');
 const { CONFIG_METADATA, ENCODER_FIELDS, validateAllSettings, validateEncoder, saveConfig, loadConfig, getDefaults } = require('./config-manager');
 const { LOGIN_SITES, loginEncoders, loginSling } = require('./login-manager');
 const credentialsStore = require('./credentials-store');
@@ -4081,8 +4081,7 @@ async function launchBrowser(targetUrl, encoderConfig, startMinimized, applyStar
     // Add audio configuration if device specified
     // Validate audio device before adding to launch args
     if (encoderConfig.audioDevice) {
-      const audioManager = new AudioDeviceManager();
-      const result = await audioManager.validateDevice(encoderConfig.audioDevice);
+      const result = await audioDeviceManager.validateDevice(encoderConfig.audioDevice);
       
       if (result.valid) {
         launchArgs.push(
@@ -4538,6 +4537,12 @@ function setupESPNErrorMonitor(page, encoderConfig = null) {
     return;
   }
 
+  // The browser page is pooled and reused across tunes; clear any monitor still
+  // running from a previous stream so intervals don't accumulate on this page.
+  if (page.__ch4cESPNMonitorId) {
+    clearInterval(page.__ch4cESPNMonitorId);
+  }
+
   const url = page.url();
   const CHECK_INTERVAL_MS = 30000;
   const FAILURES_BEFORE_RECOVERY = 2;
@@ -4604,6 +4609,8 @@ function setupESPNErrorMonitor(page, encoderConfig = null) {
     }
   }, CHECK_INTERVAL_MS);
 
+  page.__ch4cESPNMonitorId = intervalId;
+
   logTS(`ESPN error recovery monitor active (${CHECK_INTERVAL_MS / 1000}s interval, max ${MAX_RECOVERY_ATTEMPTS} recoveries)`);
 }
 
@@ -4620,13 +4627,18 @@ async function setupPauseMonitor(frameHandle, videoHandle, page) {
   }
 
   try {
-    // Forward browser console messages to Node.js console (only [CH4C] tagged messages)
-    page.on('console', msg => {
-      const text = msg.text();
-      if (text.startsWith('[CH4C]')) {
-        logTS(text);
-      }
-    });
+    // Forward browser console messages to Node.js console (only [CH4C] tagged messages).
+    // The page is pooled and setupPauseMonitor runs once per tune, so guard against
+    // attaching a duplicate listener every time this page is reused for a new stream.
+    if (!page.__ch4cConsoleHooked) {
+      page.__ch4cConsoleHooked = true;
+      page.on('console', msg => {
+        const text = msg.text();
+        if (text.startsWith('[CH4C]')) {
+          logTS(text);
+        }
+      });
+    }
 
     await frameHandle.evaluate((video, intervalSeconds) => {
       // Prevent multiple monitors on the same video
@@ -7927,9 +7939,8 @@ ${processInfo && processInfo.pid !== 'Unknown' ?
 
   // Log available audio devices at startup
   try {
-    const startupAudioManager = new AudioDeviceManager();
-    const detectedDevices = await startupAudioManager.getAudioDevices();
-    if (startupAudioManager.moduleAvailable === false) {
+    const detectedDevices = await audioDeviceManager.getAudioDevices();
+    if (audioDeviceManager.moduleAvailable === false) {
       logTS('WARNING: AudioDeviceCmdlets PowerShell module not installed. Some audio devices may not be detected.');
       logTS('To install, run in Administrator PowerShell: Install-Module -Name AudioDeviceCmdlets -Force');
     }
@@ -8486,9 +8497,8 @@ ${processInfo && processInfo.pid !== 'Unknown' ?
   });
 
   app.get('/audio-devices', async (req, res) => {
-    const audioManager = new AudioDeviceManager();
-    const devices = await audioManager.getAudioDevices();
-    res.json({ devices, moduleAvailable: audioManager.moduleAvailable });
+    const devices = await audioDeviceManager.getAudioDevices(true);
+    res.json({ devices, moduleAvailable: audioDeviceManager.moduleAvailable });
   });
 
   // GET /displays - Get display/monitor configuration
