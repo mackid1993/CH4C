@@ -4066,6 +4066,18 @@ async function launchBrowser(targetUrl, encoderConfig, startMinimized, applyStar
       '--disable-background-timer-throttling',
       '--disable-background-media-suspend',
       '--disable-backgrounding-occluded-windows',
+      // Stop Chrome lowering the renderer process priority when the capture
+      // window isn't the OS foreground window (the renderer runs the software
+      // video decode); pairs with the --disable-background-* flags above.
+      '--disable-renderer-backgrounding',
+      // Disable Windows native-window occlusion tracking - a documented source
+      // of periodic jank/lock contention, and pure overhead for a capture
+      // window that is never occluded - plus assorted idle telemetry/discovery
+      // features (Cast/DIAL polling, optimization-hint downloads, etc.).
+      '--disable-features=CalculateNativeWinOcclusion,Translate,OptimizationHints,OptimizationGuideModelDownloading,MediaRouter,DialMediaRouteProvider,InterestFeedContentSuggestions,AutofillServerCommunication,CertificateTransparencyComponentUpdater',
+      // No crash reporter needed - CH4C has its own browser-crash recovery.
+      '--disable-breakpad',
+      '--disable-crash-reporter',
     ];
 
     if (applyStartFullScreenArg) {
@@ -4492,7 +4504,14 @@ async function setupAudioMonitor(frameHandle, videoHandle, audioDevice, encoderU
       video.__audioMonitorActive = true;
 
       // Check and re-apply audio every 15 seconds
-      setInterval(async () => {
+      const audioMonitorId = setInterval(async () => {
+        // The site can swap out the <video> element mid-stream (ads, quality
+        // changes); self-terminate so this interval doesn't leak and keep
+        // calling enumerateDevices() on a detached element forever.
+        if (!video.isConnected) {
+          clearInterval(audioMonitorId);
+          return;
+        }
         try {
           const currentSinkId = video.sinkId;
 
@@ -4647,7 +4666,13 @@ async function setupPauseMonitor(frameHandle, videoHandle, page) {
       }
       video.__pauseMonitorActive = true;
 
-      setInterval(() => {
+      const pauseMonitorId = setInterval(() => {
+        // Self-terminate if the site swapped out this <video> element, so the
+        // interval doesn't leak on a detached element.
+        if (!video.isConnected) {
+          clearInterval(pauseMonitorId);
+          return;
+        }
         if (video.paused && !video.ended) {
           console.log('[CH4C] Video paused - attempting to resume...');
           video.play().catch(err => {
